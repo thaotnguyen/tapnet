@@ -22,11 +22,15 @@ import cv2
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import mediapy as media
 import numpy as np
 from tapnet import tapir_model
 from tapnet.utils import model_utils
+from tapnet.utils import transforms
+from tapnet.utils import viz_utils
 
 
+video = media.read_video('assets/videos/P800853_11_10_22_run3.mp4')
 NUM_POINTS = 8
 
 
@@ -35,14 +39,15 @@ def load_checkpoint(checkpoint_path):
   return ckpt_state["params"], ckpt_state["state"]
 
 
-tapir = tapir_model.TAPIR(
+tapir = lambda: tapir_model.TAPIR(
     use_causal_conv=True, bilinear_interp_with_depthwise_conv=False
 )
 
 
 def build_online_model_init(frames, points):
-  feature_grids = tapir.get_feature_grids(frames, is_training=False)
-  features = tapir.get_query_features(
+  tapir_instance = tapir()
+  feature_grids = tapir_instance.get_feature_grids(frames, is_training=False)
+  features = tapir_instance.get_query_features(
       frames,
       is_training=False,
       query_points=points,
@@ -50,11 +55,22 @@ def build_online_model_init(frames, points):
   )
   return features
 
+def build_online_model_init(frames, points):
+  tapir_instance = tapir()
+  feature_grids = tapir_instance.get_feature_grids(frames, is_training=False)
+  features = tapir_instance.get_query_features(
+      frames,
+      is_training=False,
+      query_points=points,
+      feature_grids=feature_grids,
+  )
+  return features
 
 def build_online_model_predict(frames, features, causal_context):
   """Compute point tracks and occlusions given frames and query points."""
-  feature_grids = tapir.get_feature_grids(frames, is_training=False)
-  trajectories = tapir.estimate_trajectories(
+  tapir_instance = tapir()
+  feature_grids = tapir_instance.get_feature_grids(frames, is_training=False)
+  trajectories = tapir_instance.estimate_trajectories(
       frames.shape[-3:-1],
       is_training=False,
       feature_grids=feature_grids,
@@ -68,6 +84,40 @@ def build_online_model_predict(frames, features, causal_context):
   del trajectories["causal_context"]
   return {k: v[-1] for k, v in trajectories.items()}, causal_context
 
+def sample_random_points(frame_max_idx, height, width, num_points):
+  """Sample random points with (time, height, width) order."""
+  y = np.random.randint(0, height, (num_points, 1))
+  x = np.random.randint(0, width, (num_points, 1))
+  t = np.random.randint(0, frame_max_idx + 1, (num_points, 1))
+  points = np.concatenate((t, y, x), axis=-1).astype(np.int32)  # [num_points, 3]
+  return points
+
+def preprocess_frames(frames):
+  """Preprocess frames to model inputs.
+
+  Args:
+    frames: [num_frames, height, width, 3], [0, 255], np.uint8
+
+  Returns:
+    frames: [num_frames, height, width, 3], [-1, 1], np.float32
+  """
+  frames = frames.astype(np.float32)
+  frames = frames / 255 * 2 - 1
+  return frames
+
+def postprocess_occlusions(occlusions, expected_dist):
+  """Postprocess occlusions to boolean visible flag.
+
+  Args:
+    occlusions: [num_points, num_frames], [-inf, inf], np.float32
+
+  Returns:
+    visibles: [num_points, num_frames], bool
+  """
+  pred_occ = jax.nn.sigmoid(occlusions)
+  pred_occ = 1 - (1 - pred_occ) * (1 - jax.nn.sigmoid(expected_dist))
+  visibles = pred_occ < 0.5  # threshold
+  return visibles
 
 def get_frame(video_capture):
   r_val, image = video_capture.read()
@@ -78,10 +128,6 @@ def get_frame(video_capture):
     image = image[trunc:-trunc]
   return r_val, image
 
-
-print("Welcome to the TAPIR live demo.")
-print("Please note that if the framerate is low (<~12 fps), TAPIR performance")
-print("may degrade and you may need a more powerful GPU.")
 
 print("Loading checkpoint...")
 # --------------------
@@ -105,18 +151,6 @@ online_predict_apply = functools.partial(
     online_predict_apply, params=params, state=state, rng=rng
 )
 
-print("Initializing camera...")
-# --------------------
-# Start point tracking
-vc = cv2.VideoCapture(0)
-
-vc.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-if vc.isOpened():  # try to get the first frame
-  rval, frame = get_frame(vc)
-else:
-  raise ValueError("Unable to open camera.")
-
 pos = tuple()
 query_frame = True
 have_point = [False] * NUM_POINTS
@@ -127,98 +161,47 @@ next_query_idx = 0
 print("Compiling jax functions (this may take a while...)")
 # --------------------
 # Call one time to compile
-query_points = jnp.zeros([NUM_POINTS, 3], dtype=jnp.float32)
-query_features, _ = online_init_apply(
-    frames=model_utils.preprocess_frames(frame[None, None]),
-    points=query_points[None, 0:1],
-)
-jax.block_until_ready(query_features)
 
-query_features, _ = online_init_apply(
-    frames=model_utils.preprocess_frames(frame[None, None]),
-    points=query_points[None],
-)
-causal_state = tapir.construct_initial_causal_state(
+height, width = video.shape[1:3]
+
+resize_height = 256  # @param {type: "integer"}
+resize_width = 256  # @param {type: "integer"}
+num_points = 20  # @param {type: "integer"}
+
+frames = media.resize_video(video, (resize_height, resize_width))
+query_points = sample_random_points(0, frames.shape[1], frames.shape[2], num_points)
+query_features, _ = online_init_apply(frames=preprocess_frames(frames[None, None, 0]), points=query_points[None])
+
+causal_state = hk.transform_with_state(lambda : tapir().construct_initial_causal_state(
     NUM_POINTS, len(query_features.resolutions) - 1
+)).apply(params=params, state=state, rng=rng)[0]
+
+update_query_features_apply = functools.partial(
+  hk.transform_with_state(lambda **kwargs: tapir().update_query_features(**kwargs)).apply,
+  params=params, state=state, rng=rng
 )
-(prediction, causal_state), _ = online_predict_apply(
-    frames=model_utils.preprocess_frames(frame[None, None]),
-    features=query_features,
-    causal_context=causal_state,
-)
-
-jax.block_until_ready(prediction["tracks"])
-
-last_click_time = 0
-
-
-def mouse_click(event, x, y, flags, param):
-  del flags, param
-  global pos, query_frame, last_click_time
-
-  # event fires multiple times per click sometimes??
-  if (time.time() - last_click_time) < 0.5:
-    return
-
-  if event == cv2.EVENT_LBUTTONDOWN:
-    pos = (y, frame.shape[1] - x)
-    query_frame = True
-    last_click_time = time.time()
-
-
-cv2.namedWindow("Point Tracking")
-cv2.setMouseCallback("Point Tracking", mouse_click)
 
 t = time.time()
 step_counter = 0
 
-while rval:
-  rval, frame = get_frame(vc)
-  if query_frame:
-    query_points = jnp.array((0,) + pos, dtype=jnp.float32)
+predictions = []
+for i in range(frames.shape[0]):
+  print('{:.1}%\r'.format(float(i*100)/frames.shape[0]), end='')
+  (prediction, causal_state), _ = online_predict_apply(
+      frames=preprocess_frames(frames[None, None, i]),
+      features=query_features,
+      causal_context=causal_state,
+  )
+  predictions.append(prediction)
 
-    init_query_features, _ = online_init_apply(
-        frames=model_utils.preprocess_frames(frame[None, None]),
-        points=query_points[None, None],
-    )
-    query_frame = False
-    query_features, causal_state = tapir.update_query_features(
-        query_features, init_query_features, [next_query_idx], causal_state
-    )
-    have_point[next_query_idx] = True
-    next_query_idx = (next_query_idx + 1) % NUM_POINTS
-  if pos:
-    (prediction, causal_state), _ = online_predict_apply(
-        frames=model_utils.preprocess_frames(frame[None, None]),
-        features=query_features,
-        causal_context=causal_state,
-    )
-    track = prediction["tracks"][0, :, 0]
-    occlusion = prediction["occlusion"][0, :, 0]
-    expected_dist = prediction["expected_dist"][0, :, 0]
-    visibles = model_utils.postprocess_occlusions(occlusion, expected_dist)
-    track = np.round(track)
+tracks = np.concatenate([x['tracks'][0] for x in predictions], axis=1)
+occlusions = np.concatenate([x['occlusion'][0] for x in predictions], axis=1)
+expected_dist = np.concatenate([x['expected_dist'][0] for x in predictions], axis=1)
 
-    for i, _ in enumerate(have_point):
-      if visibles[i] and have_point[i]:
-        cv2.circle(
-            frame, (int(track[i, 0]), int(track[i, 1])), 5, (255, 0, 0), -1
-        )
-        if track[i, 0] < 16 and track[i, 1] < 16:
-          print((i, next_query_idx))
-  cv2.imshow("Point Tracking", frame[:, ::-1])
-  if pos:
-    step_counter += 1
-    if time.time() - t > 5:
-      print(f"{step_counter/(time.time()-t)} frames per second")
-      t = time.time()
-      step_counter = 0
-  else:
-    t = time.time()
-  key = cv2.waitKey(1)
+visibles = postprocess_occlusions(occlusions, expected_dist)
 
-  if key == 27:  # exit on ESC
-    break
-
-cv2.destroyWindow("Point Tracking")
-vc.release()
+# Visualize sparse point tracks
+colormap = viz_utils.get_colors(20)
+tracks = transforms.convert_grid_coordinates(tracks, (resize_width, resize_height), (width, height))
+video_viz = viz_utils.paint_point_track(video, tracks, visibles, colormap)
+media.write_video('saved_video.mp4', video_viz, fps=10)
